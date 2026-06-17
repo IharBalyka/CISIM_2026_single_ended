@@ -19,6 +19,10 @@ from tqdm import tqdm
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODELS = {
+    "ODG_DeepMS(Att+Res)": {
+        "ckpt": os.path.join(SCRIPT_DIR, "DeepMS(Att+Res).pth"),
+        "type": "big_att",
+    },
     "ODG_DeepMS(RES)": {
         "ckpt": os.path.join(SCRIPT_DIR, "DeepMS(RES).pth"),
         "type": "big",
@@ -148,6 +152,40 @@ def _make_backbone(use_res: bool):
         return layers
     return nn.Sequential(*stage(1, 32), *stage(32, 64), *stage(64, 128), *stage(128, 256), *stage(256, 512))
 
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        scale = self.se(x).view(x.size(0), x.size(1), 1, 1)
+        return x * scale
+
+class ModelLogOnlyAtt(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone  = _make_backbone(use_res=True)
+        self.attention = SEBlock(512, reduction=16)   # only difference
+        self.pool      = nn.AdaptiveAvgPool2d((1, 1))
+        self.head      = nn.Sequential(
+            nn.Linear(512, 256), nn.ReLU(), AdaptiveDropout(),
+            nn.Linear(256, 128), nn.ReLU(), AdaptiveDropout(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x_linear):
+        x = self.backbone(x_linear.unsqueeze(1))
+        x = self.attention(x)
+        x = self.pool(x).flatten(1)
+        return self.head(x)
+
 class ModelLogOnly(nn.Module):
     def __init__(self):
         super().__init__()
@@ -201,7 +239,12 @@ class ModelLogWave(nn.Module):
 # ==========================================================
 
 def load_model(model_type: str, ckpt_path: str) -> nn.Module:
-    net = ModelLogOnly() if model_type == "big" else ModelLogWave()
+    if model_type == "big_att":
+        net = ModelLogOnlyAtt()
+    elif model_type == "big":
+        net = ModelLogOnly()
+    else:
+        net = ModelLogWave()
     ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("state_dict", ckpt)
     state = {k.replace("model.", "", 1): v for k, v in state.items()}
@@ -214,7 +257,7 @@ def main():
     parser.add_argument("--output", default="results.csv")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--full_audio", action="store_true")
-    parser.add_argument("--models", choices=["small", "big", "both"], default="both")
+    parser.add_argument("--models", choices=["small", "big", "big_att", "all"], default="all")
     args = parser.parse_args()
 
     pattern = os.path.join(args.input_dir, "**/*.wav") if args.recursive else os.path.join(args.input_dir, "*.wav")
@@ -222,7 +265,7 @@ def main():
 
     loaded_models = {}
     for name, info in MODELS.items():
-        if args.models != "both" and info["type"] != args.models: continue
+        if args.models != "all" and info["type"] != args.models: continue
         if os.path.exists(info["ckpt"]):
             print(f"Loading {name}...")
             loaded_models[name] = {"net": load_model(info["type"], info["ckpt"]), "type": info["type"]}
@@ -238,7 +281,7 @@ def main():
                 specs, waves = specs.to(DEVICE), waves.to(DEVICE)
                 row = {"filename": path}
                 for name, m in loaded_models.items():
-                    preds = m["net"](specs) if m["type"] == "big" else m["net"](specs, waves)
+                    preds = m["net"](specs) if (m["type"] == "big") or (m["type"] == "big_att") else m["net"](specs, waves)
                     row[name] = preds.mean().item()
                 rows.append(row)
 
